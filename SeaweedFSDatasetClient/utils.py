@@ -1,3 +1,5 @@
+from pathlib import Path
+
 def is_notebook() -> bool:
     try:
         shell = get_ipython().__class__.__name__
@@ -10,4 +12,3 @@ def is_notebook() -> bool:
     except NameError:
         return False     
     
-

@@ -1,0 +1,18 @@
+version: '3.9'
+
+services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    ports:
+      - "9333:9333"   # Master
+      - "8080:8080"   # Volume
+      - "8888:8888"   # Filer
+      - "8333:8333"   # S3 Gateway 
+    command: >
+      server
+      -s3
+      -s3.port=8333
+      -dir=/data
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

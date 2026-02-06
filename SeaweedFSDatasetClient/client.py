@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Union
 from collections.abc import Sequence
 import itertools
+import logging
 
 
 
@@ -21,6 +22,32 @@ class SeaweedFSDataClient:
         self.filer_url = URL(filer_url)
         self.root = root
         self.base_location = self.filer_url / self.root
+
+
+    def _get_url(self, file_location: str|Path):
+        return self.base_location / str(file_location).replace("\\", "/")
+
+
+    def _create_remote_directory(self, path:URL):
+        path = path / ""
+        requests.post(str(path))
+
+
+    def _sync_upload(self, 
+                     file: bytes|str|Path,
+                     target_location: URL,
+                     file_name: str):
+        
+        if isinstance(file, (str, Path)):
+            file = Path(file)
+            file_name = file.name 
+            with open(file, "rb") as f:
+                file = f.read()
+
+        target_location = target_location / file_name
+        package = {"file": (file_name, file)}
+        response = requests.post(url=str(target_location), files=package)
+        return response.status_code
 
 
     async def _async_upload(self,
@@ -55,57 +82,49 @@ class SeaweedFSDataClient:
             return response.status 
 
 
-    def _sync_upload(self, 
-                     file: bytes|str|Path,
-                     target_location: URL,
-                     file_name: str):
+    def _sync_load(self, 
+                   file_location: str|Path, 
+                   raise_if_not_200:bool) -> bytes:
+
+        location = self._get_url(file_location)
+        res = requests.get(str(location))
+
+        if raise_if_not_200:
+            res.raise_for_status()
+
+        return res.content
+
+
+    async def _async_load(self, 
+                          file_location: list[str|Path], 
+                          raise_if_not_200: bool) -> list[bytes]:
+        tasks = []
+        async with aiohttp.ClientSession() as session:
+            tasks = [self._async_load_one(session, file_loc, raise_if_not_200) for file_loc in file_location]
+            return await tqdm.gather(*tasks, desc="Download files", leave=True)
+
+
+    async def _async_load_one(self,
+                              session: aiohttp.ClientSession,
+                              file_location: str|Path,
+                              raise_if_not_200: bool) -> bytes:
+        location = self._get_url(file_location)
+        async with session.get(location) as response:
+            if raise_if_not_200:
+                response.raise_for_status()
+            content = await response.read()
+            return content
         
-        if isinstance(file, (str, Path)):
-            file = Path(file)
-            file_name = file.name 
-            with open(file, "rb") as f:
-                file = f.read()
-
-        target_location = target_location / file_name
-        package = {"file": (file_name, file)}
-        response = requests.post(url=str(target_location), files=package)
-        return response.status_code
-
-
-    def _create_remote_directory(self, path:URL):
-        path = path / ""
-        requests.post(str(path))
-
-
-    def mkdirs(self, 
-               path:str|Path):
-        if not Path(path).is_dir():
-            raise ValueError(f"Was passed is not a dir\n{path}")
-        
-        path = str(path).replace("\\", "/")
-        location = self.base_location / path 
-        self._create_remote_directory(location)
-
-
-    def exists_directory(self,
-                         path:str|Path):
-        path = str(path).replace("\\", "/")
-        location = self.base_location / path
-
-        status = requests.get(str(location)).status_code 
-
-        return status in [200, 201]
-
 
     def listdir(self, 
-                path: str|Path,
+                file_location: str|Path,
                 get_all=True,
-                raw: bool=False):
+                raw: bool=False) -> list[str]|list[dict]:
         
-        if not self.exists_directory(path):
-            raise FileNotFoundError(f"Directory is not exists\n{path}")
+        if not self.exists(file_location):
+            raise FileNotFoundError(f"Directory is not exists\n{file_location}")
         
-        target_location = self.base_location / str(path).replace("\\", "/")
+        target_location = self._get_url(file_location) / ""
         target_location = str(target_location)
         file_list = []
 
@@ -136,6 +155,43 @@ class SeaweedFSDataClient:
             return [Path(item["FullPath"]).name for item in file_list]
 
 
+    def mkdirs(self, 
+               file_location: str|Path) -> None:
+        
+        ch = [".", "*", "?", ":", "<", ">", "|", "\""]
+        if any(char in str(file_location) for char in ch):
+            raise ValueError(f"Was passed is not a dir\n{file_location}")
+
+        location = self._get_url(file_location)
+        self._create_remote_directory(location)
+
+
+    def exists(self, file_location: str|Path) -> bool:
+        location = self._get_url(file_location)
+
+        status = requests.get(str(location)).status_code 
+
+        return status in [200, 201] 
+
+
+    def remove(self, 
+                file_location: str|Path, 
+                recursive: bool=False) -> int:
+            
+            location = self._get_url(file_location)
+
+            param = {"recursive": "true"} if recursive else {}
+
+            response = requests.delete(str(location), params=param)
+
+            status = response.status_code
+
+            if status == 500:
+                raise ValueError("File is not exists or directory is not empty. If you want remove not empty directory set recursive=True")
+
+            return status
+
+
     def push(self, 
              files: bytes|str|Path|Sequence[Union[bytes, str, Path]],
              file_location: str|Path,
@@ -144,7 +200,7 @@ class SeaweedFSDataClient:
         if not self.exists_directory(file_location):
             raise FileNotFoundError(f"Directory is not exists\n{file_location}\nIf you want create folder in file uploading use `push_folder` method")
 
-        target_location = self.base_location / str(file_location).replace("\\", "/")
+        target_location = self._get_url(file_location)
 
         if isinstance(files, list):
             if not sum([isinstance(obj, type(files[0])) for obj in files]) == len(files):  # checking on same dtype in input
@@ -176,7 +232,7 @@ class SeaweedFSDataClient:
 
     def push_folder(self, 
                      path_to_folder: str|Path,
-                     remote_folder_name: str|None=None):
+                     remote_folder_name: str|None=None) -> dict:
         
         path_to_folder = Path(path_to_folder)
         if not path_to_folder.is_dir():
@@ -185,13 +241,14 @@ class SeaweedFSDataClient:
         if remote_folder_name is None:
             remote_folder_name = path_to_folder.name
 
+        logging.info("Analise the directory ...")
         files = [f for f in path_to_folder.rglob("*") if f.is_file()]
         grouped_paths_iter = itertools.groupby(files, key=lambda p: p.parent)
 
         report = {}
         for folder, src_paths in grouped_paths_iter:
-            location = str(folder.relative_to(path_to_folder)).replace("\\", "/")
-            target_location = self.base_location / remote_folder_name / location
+            location = Path(remote_folder_name) / folder.relative_to(path_to_folder)
+            target_location = self._get_url(location)
 
             src_paths = list(src_paths)
             
@@ -201,41 +258,7 @@ class SeaweedFSDataClient:
             report[location] = dict(zip(src_paths, status))
 
         return report
-
-
-    def _sync_load(self, 
-                   file_location: str|Path, 
-                   raise_if_not_200:bool) -> bytes:
-
-        location = self.base_location/str(file_location).replace("\\", "/")
-        res = requests.get(str(location))
-
-        if raise_if_not_200:
-            res.raise_for_status()
-
-        return res.content
-    
-
-    async def _async_load(self, 
-                          file_location: list[str|Path], 
-                          raise_if_not_200: bool) -> list[bytes]:
-        tasks = []
-        async with aiohttp.ClientSession() as session:
-            tasks = [self._async_load_one(session, file_loc, raise_if_not_200) for file_loc in file_location]
-            return await tqdm.gather(*tasks, desc="Download files", leave=True)
-
-
-    async def _async_load_one(self,
-                              session: aiohttp.ClientSession,
-                              file_location: str|Path,
-                              raise_if_not_200: bool):
-        location = self.base_location/str(file_location).replace("\\", "/")
-        async with session.get(location) as response:
-            if raise_if_not_200:
-                response.raise_for_status()
-            content = await response.read()
-            return content
-
+ 
 
     def pull(self, 
              files: str|Path|Sequence[Union[str, Path]], 
@@ -250,4 +273,9 @@ class SeaweedFSDataClient:
             raise TypeError(f"Unsupported type of files. Expected str, pathlib.Path or list of str or pathlib.Path, but got {type(files)}")
 
         return content 
+    
+    def pull_folder(self, 
+                    file_location: str|Path, 
+                    local_path: str|Path):
+        pass 
 

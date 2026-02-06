@@ -5,7 +5,6 @@ import asyncio
 import aiohttp
 import aiofiles
 from tqdm.asyncio import tqdm
-from tqdm import tqdm as sync_tqdm
 import requests
 from yarl import URL
 from pathlib import Path
@@ -190,7 +189,7 @@ class SeaweedFSDataClient:
         grouped_paths_iter = itertools.groupby(files, key=lambda p: p.parent)
 
         report = {}
-        for folder, src_paths in sync_tqdm(grouped_paths_iter, desc="Run by folders"):
+        for folder, src_paths in grouped_paths_iter:
             location = str(folder.relative_to(path_to_folder)).replace("\\", "/")
             target_location = self.base_location / remote_folder_name / location
 
@@ -205,17 +204,50 @@ class SeaweedFSDataClient:
 
 
     def _sync_load(self, 
-                   file_location: URL):
-        res = requests.get(str(file_location))
-        res.raise_for_status()
+                   file_location: str|Path, 
+                   raise_if_not_200:bool) -> bytes:
+
+        location = self.base_location/str(file_location).replace("\\", "/")
+        res = requests.get(str(location))
+
+        if raise_if_not_200:
+            res.raise_for_status()
 
         return res.content
     
 
-    def _async_load(self, file_location):
-        pass
+    async def _async_load(self, 
+                          file_location: list[str|Path], 
+                          raise_if_not_200: bool) -> list[bytes]:
+        tasks = []
+        async with aiohttp.ClientSession() as session:
+            tasks = [self._async_load_one(session, file_loc, raise_if_not_200) for file_loc in file_location]
+            return await tqdm.gather(*tasks, desc="Download files", leave=True)
 
 
-    def pull(self, files):
-        pass 
+    async def _async_load_one(self,
+                              session: aiohttp.ClientSession,
+                              file_location: str|Path,
+                              raise_if_not_200: bool):
+        location = self.base_location/str(file_location).replace("\\", "/")
+        async with session.get(location) as response:
+            if raise_if_not_200:
+                response.raise_for_status()
+            content = await response.read()
+            return content
+
+
+    def pull(self, 
+             files: str|Path|Sequence[Union[str, Path]], 
+             raise_if_not_200: bool=True) -> bytes|list[bytes]:
+        
+        if isinstance(files, (str, Path)):
+            content = self._sync_load(files, raise_if_not_200)
+        elif isinstance(files, list):
+            coroutine = self._async_load(files, raise_if_not_200) 
+            content = asyncio.run(coroutine)
+        else:
+            raise TypeError(f"Unsupported type of files. Expected str, pathlib.Path or list of str or pathlib.Path, but got {type(files)}")
+
+        return content 
 

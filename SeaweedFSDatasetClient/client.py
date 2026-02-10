@@ -1,27 +1,32 @@
 import nest_asyncio
 nest_asyncio.apply()
 
+import logging
+import itertools
+from pathlib import Path
+from typing import Union
+from contextlib import nullcontext
+from collections.abc import Sequence
+
 import asyncio
 import aiohttp
 import aiofiles
-from tqdm.asyncio import tqdm
 import requests
 from yarl import URL
-from pathlib import Path
-from typing import Union
-from collections.abc import Sequence
-import itertools
-import logging
+from tqdm.asyncio import tqdm
+
 
 
 
 class SeaweedFSDataClient:
     def __init__(self, 
                  filer_url: str,
-                 root: str="data/datasets"):
+                 root: str="data/datasets",
+                 max_active_taks: int=100):
         self.filer_url = URL(filer_url)
         self.root = root
         self.base_location = self.filer_url / self.root
+        self.MAX_ACTIVE_TASK = max_active_taks
 
 
     def _get_url(self, file_location: str|Path):
@@ -31,6 +36,35 @@ class SeaweedFSDataClient:
     def _create_remote_directory(self, path:URL):
         path = path / ""
         requests.post(str(path))
+
+
+    def _get_remote_listdir(self, file_location: str, last_name: str|None):
+            param = {"lastFileName": last_name} if last_name else None
+
+            response = requests.get(file_location, headers={"Accept": "application/json"}, params=param)
+            response.raise_for_status()
+
+            response = response.json()
+            return response
+
+
+    def _get_remote_dir_structure(self, 
+                                  remote_dir: str|Path):
+        queue = [remote_dir]
+        paths = []
+
+        while queue:
+            path = Path(queue.pop(0))
+            files = self.listdir(path, raw=True)
+            for item in files:
+                pp = path / Path(item["FullPath"]).name
+                if item["Md5"]:  #  if Md5 is not None, then is file else is folder
+                    paths.append(pp)
+                else:
+                    queue.append(pp)
+
+        grouped_paths_iter = itertools.groupby(paths, key=lambda p: p.parent)
+        return grouped_paths_iter
 
 
     def _sync_upload(self, 
@@ -54,32 +88,33 @@ class SeaweedFSDataClient:
                             files: Sequence[Union[bytes, str, Path]],
                             file_names: Sequence[Union[str, Path]]|None,
                             target_location: URL):
-        tasks = []
+        semaphore = asyncio.Semaphore(self.MAX_ACTIVE_TASK)
         async with aiohttp.ClientSession() as session:
             if isinstance(files[0], bytes):
-                tasks = [self._async_upload_one(session, file, target_location, filename) for file, filename in zip(files, file_names)]
-            elif isinstance(files[0], (str, Path)):
-                for file in files:
-                    file = Path(file)
-                    name = file.name 
-                    async with aiofiles.open(file, "rb") as f:
-                        file = await f.read()
-                    task = self._async_upload_one(session, file, target_location, name)
-                    tasks.append(task)
+                tasks = [self._async_upload_one(session, semaphore, file, target_location, filename) for file, filename in zip(files, file_names)]
+            else:# isinstance(files, (str, Path)):
+                tasks = [self._async_upload_one(session, semaphore, file, target_location, None) for file in files]
             return await tqdm.gather(*tasks, desc="Pushing files")
 
 
     async def _async_upload_one(self, 
                       session: aiohttp.ClientSession,
-                      file: bytes, 
+                      semaphore: asyncio.Semaphore,
+                      file: bytes|str|Path, 
                       target_location: URL,
-                      file_name: str):
-        
+                      file_name: str|None):
         data = aiohttp.FormData()
-        data.add_field("file", file, filename=file_name)
-        target_location = target_location / file_name
-        async with session.post(target_location, data=data) as response:
-            return response.status 
+
+        async with semaphore:
+            if isinstance(file, (str, Path)):
+                file_name = Path(file).name 
+                async with aiofiles.open(file, "rb") as f:
+                    file = await f.read() 
+            
+            data.add_field("file", file, filename=file_name)
+            target_location = target_location / file_name
+            async with session.post(target_location, data=data) as response:
+                return response.status 
 
 
     def _sync_load(self, 
@@ -98,28 +133,55 @@ class SeaweedFSDataClient:
     async def _async_load(self, 
                           file_location: list[str|Path], 
                           raise_if_not_200: bool) -> list[bytes]:
-        tasks = []
+        semaphore = asyncio.Semaphore(self.MAX_ACTIVE_TASK)
         async with aiohttp.ClientSession() as session:
-            tasks = [self._async_load_one(session, file_loc, raise_if_not_200) for file_loc in file_location]
+            tasks = [self._async_load_one(session, semaphore, file_loc, raise_if_not_200) for file_loc in file_location]
             return await tqdm.gather(*tasks, desc="Download files", leave=True)
 
 
     async def _async_load_one(self,
                               session: aiohttp.ClientSession,
+                              semaphore: asyncio.Semaphore|nullcontext,
                               file_location: str|Path,
                               raise_if_not_200: bool) -> bytes:
         location = self._get_url(file_location)
-        async with session.get(location) as response:
-            if raise_if_not_200:
-                response.raise_for_status()
-            content = await response.read()
-            return content
+        async with semaphore:
+            async with session.get(location) as response:
+                if raise_if_not_200:
+                    response.raise_for_status()
+                content = await response.read()
+                return content
         
+
+    async def _async_save_after_load_one(self, 
+                                         session: aiohttp.ClientSession, 
+                                         semaphore: asyncio.Semaphore, 
+                                         file_location: str|Path, 
+                                         path_to_save: str|Path, 
+                                         raise_if_not_200: bool):
+        
+        async with semaphore:
+            content = await self._async_load_one(session, nullcontext(), file_location, raise_if_not_200)
+            file_location = Path(file_location)
+            path_to_save = Path(path_to_save)
+
+            file_location.parent.mkdir(exist_ok=True, parents=True)
+            async with aiofiles.open(path_to_save / file_location, "wb") as f:
+                await f.write(content)
+
+
+    async def _async_save_after_load(self, file_location, path_to_save, raise_if_not_200):
+        semaphore = asyncio.Semaphore(self.MAX_ACTIVE_TASK)
+        async with aiohttp.ClientSession() as session:
+            tasks = [self._async_save_after_load_one(session, semaphore, file, path_to_save, raise_if_not_200) for file in file_location]
+            return await tqdm.gather(*tasks, desc="Download files to folder", leave=True)
+
 
     def listdir(self, 
                 file_location: str|Path,
-                get_all=True,
-                raw: bool=False) -> list[str]|list[dict]:
+                get_all: bool=True,
+                raw: bool=False,
+                last_name: str|None=None) -> list[str]|list[dict]:
         
         if not self.exists(file_location):
             raise FileNotFoundError(f"Directory is not exists\n{file_location}")
@@ -128,10 +190,7 @@ class SeaweedFSDataClient:
         target_location = str(target_location)
         file_list = []
 
-        response = requests.get(target_location, headers={"Accept": "application/json"})
-        response.raise_for_status()
-
-        response = response.json()
+        response = self._get_remote_listdir(target_location, None)
 
         entry = response["Entries"]
         if entry:
@@ -139,15 +198,13 @@ class SeaweedFSDataClient:
         last_name = response["LastFileName"]
 
         while get_all and entry:
-            response = requests.get(target_location, 
-                                    params={"lastFileName": last_name}, 
-                                    headers={"Accept": "application/json"})
-            response.raise_for_status()
-            response = response.json()
+            response = self._get_remote_listdir(target_location, last_name)
 
             entry = response["Entries"]
             if entry:
-                file_list.append(entry)
+                file_list.extend(entry)
+
+            last_name = response["LastFileName"]
 
         if raw:
             return file_list
@@ -197,7 +254,7 @@ class SeaweedFSDataClient:
              file_location: str|Path,
              file_names: str|Path|Sequence[Union[str, Path]]|None=None) -> int | list[int]:
 
-        if not self.exists_directory(file_location):
+        if not self.exists(file_location):
             raise FileNotFoundError(f"Directory is not exists\n{file_location}\nIf you want create folder in file uploading use `push_folder` method")
 
         target_location = self._get_url(file_location)
@@ -241,7 +298,7 @@ class SeaweedFSDataClient:
         if remote_folder_name is None:
             remote_folder_name = path_to_folder.name
 
-        logging.info("Analise the directory ...")
+        logging.info("Analise the local directory ...")
         files = [f for f in path_to_folder.rglob("*") if f.is_file()]
         grouped_paths_iter = itertools.groupby(files, key=lambda p: p.parent)
 
@@ -274,8 +331,21 @@ class SeaweedFSDataClient:
 
         return content 
     
+
     def pull_folder(self, 
                     file_location: str|Path, 
                     local_path: str|Path):
-        pass 
+        logging.info(("Analise the remote directory ...")) 
+
+        remote_dir_structure = self._get_remote_dir_structure(file_location)
+
+        local_path = Path(local_path)
+        for parent, files in remote_dir_structure:
+            files = list(files) 
+            local = local_path / parent
+            local.mkdir(parents=True, exist_ok=True)
+            coroutine = self._async_save_after_load(file_location=files, 
+                                                    path_to_save=local_path, 
+                                                    raise_if_not_200=True)
+            asyncio.run(coroutine)
 

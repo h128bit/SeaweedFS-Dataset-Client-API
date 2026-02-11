@@ -1,0 +1,7 @@
+nest_asyncio
+asyncio
+aiohttp
+aiofiles
+requests
+yarl
+tqdm

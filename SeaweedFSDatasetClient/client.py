@@ -4,7 +4,7 @@ nest_asyncio.apply()
 import logging
 import itertools
 from pathlib import Path
-from typing import Union
+from typing import Union, Iterator
 from contextlib import nullcontext
 from collections.abc import Sequence
 
@@ -23,6 +23,10 @@ class SeaweedFSDataClient:
                  filer_url: str,
                  root: str="data/datasets",
                  max_active_taks: int=100):
+        """
+        Client for interaction with SeaweedFS. 
+
+        """
         self.filer_url = URL(filer_url)
         self.root = root
         self.base_location = self.filer_url / self.root
@@ -30,15 +34,29 @@ class SeaweedFSDataClient:
 
 
     def _get_url(self, file_location: str|Path):
+        """
+        Helper method for getting full url to interaction with storage
+
+        """
         return self.base_location / str(file_location).replace("\\", "/")
 
 
     def _create_remote_directory(self, path:URL):
+        """
+        Method for create folder on remote storage
+
+        """
+
         path = path / ""
         requests.post(str(path))
 
 
     def _get_remote_listdir(self, file_location: str, last_name: str|None):
+            """
+            Method for getting metadata of remote folder in storage
+
+            """
+
             param = {"lastFileName": last_name} if last_name else None
 
             response = requests.get(file_location, headers={"Accept": "application/json"}, params=param)
@@ -48,29 +66,14 @@ class SeaweedFSDataClient:
             return response
 
 
-    def _get_remote_dir_structure(self, 
-                                  remote_dir: str|Path):
-        queue = [remote_dir]
-        paths = []
-
-        while queue:
-            path = Path(queue.pop(0))
-            files = self.listdir(path, raw=True)
-            for item in files:
-                pp = path / Path(item["FullPath"]).name
-                if item["Md5"]:  #  if Md5 is not None, then is file else is folder
-                    paths.append(pp)
-                else:
-                    queue.append(pp)
-
-        grouped_paths_iter = itertools.groupby(paths, key=lambda p: p.parent)
-        return grouped_paths_iter
-
-
     def _sync_upload(self, 
                      file: bytes|str|Path,
                      target_location: URL,
                      file_name: str):
+        """
+        Method for synchronous upload one file
+
+        """
         
         if isinstance(file, (str, Path)):
             file = Path(file)
@@ -88,6 +91,11 @@ class SeaweedFSDataClient:
                             files: Sequence[Union[bytes, str, Path]],
                             file_names: Sequence[Union[str, Path]]|None,
                             target_location: URL):
+        """
+        Method for generate coroutines for asynchronus file upload.
+
+        """
+
         semaphore = asyncio.Semaphore(self.MAX_ACTIVE_TASK)
         async with aiohttp.ClientSession() as session:
             if isinstance(files[0], bytes):
@@ -103,6 +111,11 @@ class SeaweedFSDataClient:
                       file: bytes|str|Path, 
                       target_location: URL,
                       file_name: str|None):
+        """
+        Method for create task for asynchronous upload one file
+
+        """
+
         data = aiohttp.FormData()
 
         async with semaphore:
@@ -120,6 +133,11 @@ class SeaweedFSDataClient:
     def _sync_load(self, 
                    file_location: str|Path, 
                    raise_if_not_200:bool) -> bytes:
+        """
+        Method for synchronous download one file
+
+        """
+
 
         location = self._get_url(file_location)
         res = requests.get(str(location))
@@ -133,6 +151,11 @@ class SeaweedFSDataClient:
     async def _async_load(self, 
                           file_location: list[str|Path], 
                           raise_if_not_200: bool) -> list[bytes]:
+        """
+        Method for generate coroutines for asynchronous download files
+
+        """
+
         semaphore = asyncio.Semaphore(self.MAX_ACTIVE_TASK)
         async with aiohttp.ClientSession() as session:
             tasks = [self._async_load_one(session, semaphore, file_loc, raise_if_not_200) for file_loc in file_location]
@@ -144,6 +167,11 @@ class SeaweedFSDataClient:
                               semaphore: asyncio.Semaphore|nullcontext,
                               file_location: str|Path,
                               raise_if_not_200: bool) -> bytes:
+        """
+        Method for create task for asynchronous download one file
+
+        """
+
         location = self._get_url(file_location)
         async with semaphore:
             async with session.get(location) as response:
@@ -159,6 +187,10 @@ class SeaweedFSDataClient:
                                          file_location: str|Path, 
                                          path_to_save: str|Path, 
                                          raise_if_not_200: bool):
+        """
+        Method for create task for asynchronous download and save locally files
+
+        """
         
         async with semaphore:
             content = await self._async_load_one(session, nullcontext(), file_location, raise_if_not_200)
@@ -171,6 +203,11 @@ class SeaweedFSDataClient:
 
 
     async def _async_save_after_load(self, file_location, path_to_save, raise_if_not_200):
+        """
+        Method for generate coroutines for asynchronous download and save locally files
+        
+        """
+
         semaphore = asyncio.Semaphore(self.MAX_ACTIVE_TASK)
         async with aiohttp.ClientSession() as session:
             tasks = [self._async_save_after_load_one(session, semaphore, file, path_to_save, raise_if_not_200) for file in file_location]
@@ -182,7 +219,12 @@ class SeaweedFSDataClient:
                 get_all: bool=True,
                 raw: bool=False,
                 last_name: str|None=None) -> list[str]|list[dict]:
-        
+        """
+        Method for getting list of files in specified folder. Support using pagination, 
+        if get_all set to Fasle, return first 1000 files in folder.
+
+        """
+
         if not self.exists(file_location):
             raise FileNotFoundError(f"Directory is not exists\n{file_location}")
         
@@ -214,7 +256,11 @@ class SeaweedFSDataClient:
 
     def mkdirs(self, 
                file_location: str|Path) -> None:
-        
+        """
+        Create folder in remote storage. If was passed chain of path? then will created all folders
+
+        """
+
         ch = [".", "*", "?", ":", "<", ">", "|", "\""]
         if any(char in str(file_location) for char in ch):
             raise ValueError(f"Was passed is not a dir\n{file_location}")
@@ -224,6 +270,11 @@ class SeaweedFSDataClient:
 
 
     def exists(self, file_location: str|Path) -> bool:
+        """
+        Method for checking existiong file or folder
+
+        """
+
         location = self._get_url(file_location)
 
         status = requests.get(str(location)).status_code 
@@ -234,6 +285,10 @@ class SeaweedFSDataClient:
     def remove(self, 
                 file_location: str|Path, 
                 recursive: bool=False) -> int:
+            """
+            Method for remove file or folder
+
+            """
             
             location = self._get_url(file_location)
 
@@ -249,10 +304,41 @@ class SeaweedFSDataClient:
             return status
 
 
+    def get_remote_dir_structure(self,
+                                 remote_dir: str|Path) -> Iterator:
+            """
+            Method return full paths all files in passed folder. Ignore empty folders. 
+
+            """
+
+            queue = [remote_dir]
+            paths = []
+
+            while queue:
+                path = Path(queue.pop(0))
+                files = self.listdir(path, raw=True)
+                for item in files:
+                    pp = path / Path(item["FullPath"]).name
+                    if item["Md5"]:  #  if Md5 is not None, then is file else is folder
+                        paths.append(pp)
+                    else:
+                        queue.append(pp)
+
+            grouped_paths_iter = itertools.groupby(paths, key=lambda p: p.parent)
+            return grouped_paths_iter
+
+
     def push(self, 
              files: bytes|str|Path|Sequence[Union[bytes, str, Path]],
              file_location: str|Path,
              file_names: str|Path|Sequence[Union[str, Path]]|None=None) -> int | list[int]:
+        """
+        Method to upload files to remote storage. Before upload files make sure what target folder is exists. 
+        Don't created folders when upload files. Can upload files as bytes or as paths to locally files.
+        If files passed bytes when need pass names for each file. If files passed like paths when names will same like locally.
+        Used asinchronus http requests if passed list of files.
+
+        """
 
         if not self.exists(file_location):
             raise FileNotFoundError(f"Directory is not exists\n{file_location}\nIf you want create folder in file uploading use `push_folder` method")
@@ -290,7 +376,13 @@ class SeaweedFSDataClient:
     def push_folder(self, 
                      path_to_folder: str|Path,
                      remote_folder_name: str|None=None) -> dict:
-        
+        """
+        Method for upload files from local directory save folder structure. 
+        Used asinchronus http requests for upload files.
+        Ignore empty folders.
+
+        """
+
         path_to_folder = Path(path_to_folder)
         if not path_to_folder.is_dir():
             raise ValueError(f"Directory\n{path_to_folder}\nis not a folder")
@@ -320,7 +412,12 @@ class SeaweedFSDataClient:
     def pull(self, 
              files: str|Path|Sequence[Union[str, Path]], 
              raise_if_not_200: bool=True) -> bytes|list[bytes]:
-        
+        """
+        Method for download files from remote storage.
+        Used asinchronus http requests if passed list of files.
+
+        """
+
         if isinstance(files, (str, Path)):
             content = self._sync_load(files, raise_if_not_200)
         elif isinstance(files, list):
@@ -335,9 +432,16 @@ class SeaweedFSDataClient:
     def pull_folder(self, 
                     file_location: str|Path, 
                     local_path: str|Path):
+        """
+        The same what method push_folder, but for download files from remote storage to locl folder.
+        Used asinchronus http requests for download files.
+        Ignore empty folders.
+
+        """
+
         logging.info(("Analise the remote directory ...")) 
 
-        remote_dir_structure = self._get_remote_dir_structure(file_location)
+        remote_dir_structure = self.get_remote_dir_structure(file_location)
 
         local_path = Path(local_path)
         for parent, files in remote_dir_structure:
